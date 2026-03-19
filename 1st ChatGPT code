@@ -1,0 +1,197 @@
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// ===== Sensor Setup =====
+#define SENSOR_ADDR 0x12
+#define RAW_REG     0x00
+#define INVERT_RAW true
+
+// ===== States =====
+enum State {
+  FORWARD_SEARCH,
+  FOLLOW_LINE,
+  RECOVER_LINE,
+  TURN_RIGHT
+};
+
+State currentState = FORWARD_SEARCH;
+
+// ===== Parameters =====
+int baseSpeed = 150;
+float Kp = 0.02;
+
+// ===== Line Memory =====
+int lastKnownPos = 3500;
+
+// ===== Line Loss Grace =====
+unsigned long lastSeenTime = 0;
+int lineLostTimeout = 200; // ms
+
+// ===== Recovery =====
+int recoverSpeed = 110;
+
+// ===== Intersection =====
+int intersectionThreshold = 5;
+unsigned long turnStartTime = 0;
+int turnDuration = 400;
+
+// ===== Setup =====
+void setup() {
+  prizm.PrizmBegin();
+  prizm.setMotorInvert(1, 1);
+
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(100000);
+}
+
+// ===== Loop =====
+void loop() {
+  byte raw = readRawByte();
+  byte mask = toLineMask(raw);
+  int count = bitCount8(mask);
+  int pos = linePosition(mask);
+
+  switch (currentState) {
+
+    case FORWARD_SEARCH:
+      if (pos != -1) {
+        currentState = FOLLOW_LINE;
+      } else {
+        prizm.setMotorSpeeds(140, 140);
+      }
+      break;
+
+    case FOLLOW_LINE:
+      followLine(pos, count);
+      break;
+
+    case RECOVER_LINE:
+      recoverLine(pos);
+      break;
+
+    case TURN_RIGHT:
+      doRightTurn(pos);
+      break;
+  }
+}
+
+//
+// ===== FOLLOW LINE =====
+//
+void followLine(int pos, int count) {
+
+  // 🔥 INTERSECTION DETECTED
+  if (count >= intersectionThreshold) {
+    currentState = TURN_RIGHT;
+    turnStartTime = millis();
+    return;
+  }
+
+  // 🔥 LINE DETECTED
+  if (pos != -1) {
+    lastKnownPos = pos;
+    lastSeenTime = millis();
+  }
+
+  // 🔥 LINE TEMPORARILY LOST → USE MEMORY
+  if (pos == -1 && millis() - lastSeenTime < lineLostTimeout) {
+    pos = lastKnownPos;
+  }
+
+  // 🔥 FULLY LOST → RECOVER
+  if (pos == -1) {
+    currentState = RECOVER_LINE;
+    return;
+  }
+
+  int error = 3500 - pos;
+
+  // Dead zone
+  if (abs(error) < 300) {
+    prizm.setMotorSpeeds(baseSpeed, baseSpeed);
+    return;
+  }
+
+  int turn = error * Kp;
+  turn = constrain(turn, -80, 80);
+
+  int leftSpeed  = baseSpeed + turn;
+  int rightSpeed = baseSpeed - turn;
+
+  prizm.setMotorSpeeds(leftSpeed, rightSpeed);
+}
+
+//
+// ===== RECOVER =====
+//
+void recoverLine(int pos) {
+  if (pos != -1) {
+    currentState = FOLLOW_LINE;
+    return;
+  }
+
+  // Turn toward last known line
+  if (lastKnownPos < 3500) {
+    prizm.setMotorSpeeds(-recoverSpeed, recoverSpeed);
+  } else {
+    prizm.setMotorSpeeds(recoverSpeed, -recoverSpeed);
+  }
+}
+
+//
+// ===== RIGHT TURN =====
+//
+void doRightTurn(int pos) {
+  // Turn in place to the right
+  prizm.setMotorSpeeds(150, -150);
+
+  // After turning a bit, go back to follow
+  if (millis() - turnStartTime > turnDuration) {
+    currentState = FOLLOW_LINE;
+  }
+}
+
+//
+// ===== SENSOR FUNCTIONS =====
+//
+
+byte readRawByte() {
+  Wire.beginTransmission(SENSOR_ADDR);
+  Wire.write(RAW_REG);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(SENSOR_ADDR, 1);
+  if (Wire.available()) return Wire.read();
+
+  return 0xFF;
+}
+
+byte toLineMask(byte raw) {
+  return INVERT_RAW ? (byte)~raw : raw;
+}
+
+int bitCount8(byte x) {
+  int c = 0;
+  for (int i = 0; i < 8; i++) c += (x >> i) & 1;
+  return c;
+}
+
+int linePosition(byte lineMask) {
+  long sum = 0;
+  long wsum = 0;
+
+  for (int i = 0; i < 8; i++) {
+    int v = (lineMask >> i) & 1;
+    sum += v;
+    wsum += (long)v * (i * 1000);
+  }
+
+  if (sum == 0) return -1;
+  return (int)(wsum / sum);
+}
+
+
+
