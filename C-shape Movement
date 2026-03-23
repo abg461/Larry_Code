@@ -1,0 +1,24 @@
+#include <PRIZM.h>    // include the PRIZM library in the sketch
+  PRIZM prizm;
+
+void setup() {
+  prizm.PrizmBegin();   // Initialize the PRIZM controller
+  prizm.setMotorInvert(1,1);
+
+}
+
+void loop() {
+ prizm.setMotorSpeeds(200,200);
+ delay(3000);
+ prizm.setMotorSpeeds(200,-200);
+ delay(650);
+ prizm.setMotorSpeeds(200,200);
+ delay(3000);
+ prizm.setMotorSpeeds(200,-200);
+ delay(650);
+ prizm.setMotorSpeeds(200,200);
+ delay(3000);
+ prizm.setMotorSpeeds(0,0);
+ delay(1000);
+ prizm.PrizmEnd();
+}
