@@ -1,0 +1,279 @@
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// ===== Sensor Setup =====
+#define SENSOR_ADDR 0x12
+#define RAW_REG     0x00
+#define INVERT_RAW true
+
+#define lULTRA 4   // left
+#define cULTRA 3   // front
+#define rULTRA 5   // right
+
+// ===== States =====
+enum State {
+  FORWARD_SEARCH,
+  FOLLOW_LINE,
+  RECOVER_LINE,
+  STRAIGHT_THROUGH,
+  TURN_AROUND
+};
+
+State currentState = FORWARD_SEARCH;
+
+// ===== Parameters =====
+int normalSpeed = 150;
+float Kp = 0.03;
+
+// ===== Line Memory =====
+int lastKnownPos = 3500;
+
+// ===== Timing =====
+unsigned long lastSeenTime = 0;
+int lineLostTimeout = 400;
+
+unsigned long recoverStartTime = 0;
+unsigned long straightStartTime = 0;
+unsigned long turnStartTime = 0;
+
+// ===== Thresholds =====
+int intersectionThreshold = 5;
+
+// ===== Setup =====
+void setup() {
+  prizm.PrizmBegin();
+  prizm.setMotorInvert(1, 1);
+
+  // --- C-SHAPE MOVEMENT FIRST ---
+  cShapeMovement();
+
+  Serial.begin(9600);
+  Wire.begin();
+  Wire.setClock(100000);
+}
+
+// ===== MAIN LOOP =====
+void loop() {
+
+  byte raw = readRawByte();
+  byte mask = toLineMask(raw);
+  int count = bitCount8(mask);
+  int pos = linePosition(mask);
+
+  int front = prizm.readSonicSensorCM(cULTRA);
+  int left  = prizm.readSonicSensorCM(lULTRA);
+  int right = prizm.readSonicSensorCM(rULTRA);
+
+  // ===== SIMPLE COLLISION AVOIDANCE =====
+
+  // 🚨 FRONT COLLISION
+  if (front > 0 && front < 12) {
+    prizm.setMotorSpeeds(-150, -150);
+    delay(300);
+    prizm.setMotorSpeeds(150, -150);
+    delay(400);
+    return;
+  }
+
+  // ↪️ TOO CLOSE LEFT → steer right
+  if (left > 0 && left < 8) {
+    prizm.setMotorSpeeds(180, 100);
+    return;
+  }
+
+  // ↩️ TOO CLOSE RIGHT → steer left
+  if (right > 0 && right < 8) {
+    prizm.setMotorSpeeds(100, 180);
+    return;
+  }
+
+  // ===== STATE MACHINE =====
+  switch (currentState) {
+
+    case FORWARD_SEARCH:
+      if (pos != -1) {
+        currentState = FOLLOW_LINE;
+      } else {
+        prizm.setMotorSpeeds(140, 140);
+      }
+      break;
+
+    case FOLLOW_LINE:
+      followLine(pos, count);
+      break;
+
+    case RECOVER_LINE:
+      recoverLine(pos);
+      break;
+
+    case STRAIGHT_THROUGH:
+      goStraightThrough();
+      break;
+
+    case TURN_AROUND:
+      turnAround(pos);
+      break;
+  }
+}
+
+//
+// ===== C-SHAPE MOVEMENT =====
+//
+void cShapeMovement() {
+  prizm.setMotorSpeeds(200,200);
+  delay(2800);
+  prizm.setMotorSpeeds(200,-200);
+  delay(650);
+  prizm.setMotorSpeeds(200,200);
+  delay(4200);
+  prizm.setMotorSpeeds(200,-200);
+  delay(650);
+  prizm.setMotorSpeeds(200,200);
+  delay(3500);
+  prizm.setMotorSpeeds(0,0);
+  delay(1000);
+}
+
+//
+// ===== FOLLOW LINE =====
+//
+void followLine(int pos, int count) {
+
+  if (count >= intersectionThreshold) {
+    currentState = STRAIGHT_THROUGH;
+    straightStartTime = millis();
+    return;
+  }
+
+  if (pos != -1) {
+    lastKnownPos = pos;
+    lastSeenTime = millis();
+  }
+
+  if (pos == -1 && millis() - lastSeenTime < 200) {
+    pos = lastKnownPos;
+  }
+
+  if (pos == -1 && millis() - lastSeenTime > lineLostTimeout) {
+    currentState = RECOVER_LINE;
+    recoverStartTime = millis();
+    return;
+  }
+
+  int error = 3500 - pos;
+
+  if (abs(error) < 300) {
+    prizm.setMotorSpeeds(normalSpeed, normalSpeed);
+    return;
+  }
+
+  int turn = constrain(error * Kp, -80, 80);
+
+  prizm.setMotorSpeeds(
+    constrain(normalSpeed + turn, -255, 255),
+    constrain(normalSpeed - turn, -255, 255)
+  );
+}
+
+//
+// ===== RECOVER =====
+//
+void recoverLine(int pos) {
+
+  if (pos != -1) {
+    currentState = FOLLOW_LINE;
+    return;
+  }
+
+  unsigned long elapsed = millis() - recoverStartTime;
+
+  if (elapsed < 400) {
+    if (lastKnownPos < 3500)
+      prizm.setMotorSpeeds(-120, 120);
+    else
+      prizm.setMotorSpeeds(120, -120);
+  }
+  else if (elapsed < 800) {
+    if (lastKnownPos < 3500)
+      prizm.setMotorSpeeds(120, -120);
+    else
+      prizm.setMotorSpeeds(-120, 120);
+  }
+  else {
+    if (millis() % 1000 < 500)
+      prizm.setMotorSpeeds(200, 120);
+    else
+      prizm.setMotorSpeeds(120, 200);
+  }
+}
+
+//
+// ===== STRAIGHT THROUGH =====
+//
+void goStraightThrough() {
+  prizm.setMotorSpeeds(normalSpeed, normalSpeed);
+
+  if (millis() - straightStartTime > 400) {
+    currentState = FOLLOW_LINE;
+  }
+}
+
+//
+// ===== TURN AROUND =====
+//
+void turnAround(int pos) {
+
+  unsigned long elapsed = millis() - turnStartTime;
+
+  if (elapsed < 400) {
+    prizm.setMotorSpeeds(-200, -200);
+  }
+  else if (elapsed < 1000) {
+    prizm.setMotorSpeeds(120, -120);
+  }
+  else {
+    if (pos != -1)
+      currentState = FOLLOW_LINE;
+    else
+      prizm.setMotorSpeeds(100, 100);
+  }
+}
+
+//
+// ===== SENSOR FUNCTIONS =====
+//
+byte readRawByte() {
+  Wire.beginTransmission(SENSOR_ADDR);
+  Wire.write(RAW_REG);
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(SENSOR_ADDR, 1);
+  if (Wire.available()) return Wire.read();
+
+  return 0xFF;
+}
+
+byte toLineMask(byte raw) {
+  return INVERT_RAW ? (byte)~raw : raw;
+}
+
+int bitCount8(byte x) {
+  int c = 0;
+  for (int i = 0; i < 8; i++) c += (x >> i) & 1;
+  return c;
+}
+
+int linePosition(byte lineMask) {
+  long sum = 0, wsum = 0;
+
+  for (int i = 0; i < 8; i++) {
+    int v = (lineMask >> i) & 1;
+    sum += v;
+    wsum += (long)v * (i * 1000);
+  }
+
+  if (sum == 0) return -1;
+  return (int)(wsum / sum);
+}
