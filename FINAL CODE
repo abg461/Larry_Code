@@ -1,0 +1,186 @@
+#include <PRIZM.h>
+#include <Wire.h>
+
+PRIZM prizm;
+
+// ================= YAHBOOM LINE SENSOR =================
+#define SENSOR_ADDR 0x12
+#define RAW_REG     0x00
+#define INVERT_RAW  false  
+
+// ================= TUNING HARDWARE =================
+const int POT_PIN = A2; 
+
+// ================= GLOBAL VARIABLES =================
+int baseSpeed = 200;    
+int maxSpeed  = 450;
+int turnSpeed = 250;    
+int targetPosition = 3571; 
+
+float Kp = 0.05;        
+float Kd = 0.12;        
+int deadband = 250; 
+
+int lastError = 0;
+int lastKnownPosition = 3571;
+unsigned long lastPrintTime = 0;
+
+const int frontLimit = 10; 
+const int sideLimit  = 8;  
+
+// ================= LINE SENSOR FUNCTIONS =================
+byte readRawByte() {
+  Wire.beginTransmission(SENSOR_ADDR);
+  Wire.write(RAW_REG);
+  Wire.endTransmission(false);
+  Wire.requestFrom(SENSOR_ADDR, 1);
+  if (Wire.available()) return Wire.read();
+  return 0xFF;
+}
+
+int linePosition(byte mask) {
+  long sum = 0, wsum = 0;
+  for (int i = 0; i < 8; i++) {
+    int v = (mask >> i) & 1;
+    sum += v;
+    wsum += (long)v * (i * 1000);
+  }
+  if (sum == 0) return -1; 
+  return (int)(wsum / sum);
+}
+
+// ================= OBSTACLE AVOIDANCE WITH LINE MEMORY =================
+bool avoidObstacles() {
+  int front = prizm.readSonicSensorCM(3);
+  int left  = prizm.readSonicSensorCM(5);
+  int right = prizm.readSonicSensorCM(4);
+
+  if (front > 1 && front < frontLimit) {
+    prizm.setMotorSpeeds(0, 0);
+    delay(200);
+
+    // --- SMART BACKUP ---
+    int backupLinePos = -1;
+    prizm.setMotorSpeeds(-180, -180); // Move back slower to scan
+    
+    unsigned long startBackup = millis();
+    while(millis() - startBackup < 800) {
+       byte raw = readRawByte();
+       int pos = linePosition(raw);
+       if (pos != -1) backupLinePos = pos; // Capture the last seen line position
+    }
+    prizm.setMotorSpeeds(0, 0);
+    delay(200);
+
+    // --- TARGETED TURN ---
+    // If we saw a line while backing up, turn toward it.
+    // Otherwise, use the ultrasonics as a fallback.
+    if (backupLinePos != -1) {
+      if (backupLinePos < targetPosition) {
+        prizm.setMotorSpeeds(-turnSpeed, turnSpeed); // Turn Left toward line
+      } else {
+        prizm.setMotorSpeeds(turnSpeed, -turnSpeed); // Turn Right toward line
+      }
+    } else {
+      // Fallback to ultrasonics if no line was seen
+      if (left > right) prizm.setMotorSpeeds(-turnSpeed, turnSpeed); 
+      else prizm.setMotorSpeeds(turnSpeed, -turnSpeed);
+    }
+    
+    delay(700); // Shorter, controlled turn
+    prizm.setMotorSpeeds(0, 0);
+    delay(200);
+    return true; 
+  }
+
+  // Side sensors for "Wall Hugging" prevention
+  if (left > 1 && left < sideLimit) {
+    prizm.setMotorSpeeds(baseSpeed + 120, baseSpeed - 60);
+    return true;
+  }
+  if (right > 1 && right < sideLimit) {
+    prizm.setMotorSpeeds(baseSpeed - 60, baseSpeed + 120);
+    return true;
+  }
+  return false; 
+}
+
+// ================= LIVE TUNING (Kp Knob) =================
+void updateTuning() {
+  int potValue = analogRead(POT_PIN);
+  Kp = (float)potValue / 2046.0; 
+
+  if (millis() - lastPrintTime > 500) {
+    Serial.print("Kp: "); Serial.println(Kp, 4);
+    lastPrintTime = millis();
+  }
+}
+
+// ================= PID LINE FOLLOWING =================
+void followLine() {
+  if (avoidObstacles()) return;
+
+  byte raw  = readRawByte();
+  byte mask = raw; // INVERT_RAW is false
+  int position = linePosition(mask);
+
+  if (position == -1) {
+    if (lastKnownPosition < targetPosition) prizm.setMotorSpeeds(120, 220);
+    else prizm.setMotorSpeeds(220, 120);
+    return;
+  }
+
+  lastKnownPosition = position;
+  int error = position - targetPosition;
+  
+  if (abs(error) < deadband) {
+    prizm.setMotorSpeeds(baseSpeed, baseSpeed);
+    lastError = 0;
+    return;
+  }
+
+  int derivative = error - lastError;
+  int correction = (Kp * error) + (Kd * derivative);
+  lastError = error;
+
+  int leftSpeed  = baseSpeed + correction;
+  int rightSpeed = baseSpeed - correction;
+
+  leftSpeed  = constrain(leftSpeed, -maxSpeed, maxSpeed);
+  rightSpeed = constrain(rightSpeed, -maxSpeed, maxSpeed);
+
+  prizm.setMotorSpeeds(leftSpeed, rightSpeed);
+}
+
+// ================= C SHAPE MOVEMENT =================
+void cShapeMovement() {
+  prizm.setMotorSpeeds(200, 200);
+  delay(2800);
+  prizm.setMotorSpeeds(200, -200);
+  delay(650);
+  prizm.setMotorSpeeds(200, 200);
+  delay(4200);
+  prizm.setMotorSpeeds(200, -200);
+  delay(650);
+  prizm.setMotorSpeeds(200, 200);
+  delay(4000);
+  prizm.setMotorSpeeds(0, 0);
+  delay(1000);
+}
+
+// ================= SETUP AND LOOP =================
+void setup() {
+  Serial.begin(115200);
+  prizm.PrizmBegin();
+  prizm.setMotorInvert(1, 1);
+  Wire.begin();
+  pinMode(POT_PIN, INPUT);
+
+  while(prizm.readStartButton() == 0) delay(10); 
+  cShapeMovement(); 
+}
+
+void loop() {
+  updateTuning(); 
+  followLine();   
+}
